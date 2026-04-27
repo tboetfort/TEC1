@@ -1,1 +1,485 @@
+import sys
+import argparse
+from typing import Tuple
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+from scipy.optimize import minimize
 
+# Paramètres globaux
+capacite_batterie_kwh = 20.0  # Capacité de la batterie existante
+etat_charge_min = 20.0  # État de charge minimum (%) de la batterie existante
+etat_charge_max = 98.0  # État de charge maximum (%) de la batterie existante
+
+# Paramètres du supercondensateur
+capacite_supercondensateur_kwh = 5.0 # Capacité du supercondensateur (kWh)
+etat_charge_min_sc = 0.0 # État de charge minimum (%) du supercondensateur
+etat_charge_max_sc = 100.0 # État de charge maximum (%) du supercondensateur
+
+# Paramètres des véhicules électriques (EV)
+moyenne_voitures_par_foyer = 0.5 # Nombre moyen de voitures par foyer
+capacite_batterie_voiture_kwh = 50.0 # Capacité moyenne de la batterie d'une voiture citadine (kWh)
+energie_quotidienne_min_recharge_ev_kwh = 10.0 # Énergie quotidienne minimale requise pour la recharge EV par voiture (kWh)
+energie_quotidienne_max_recharge_ev_kwh = 30.0 # Énergie quotidienne maximale requise pour la recharge EV par voiture (kWh)
+heure_debut_recharge_ev = 8 # Heure de début typique pour la recharge EV (8h)
+heure_fin_recharge_ev = 19 # Heure de fin typique pour la recharge EV (19h)
+
+# Décharge max par heure pour les batteries
+max_decharge_horaire_batt_pourcentage = 10.0 # Décharge max par heure (%) de la batterie (Updated from 20.0 to 10.0)
+
+# Rendements
+rendement_panneaux_solaires = 0.24 # Rendement des panneaux solaires (24%)
+rendement_eolien = 0.50 # Rendement éolien (50%)
+rendement_batterie = 0.96 # Rendement des batteries (96%)
+rendement_supercondensateur = 0.98 # Rendement du supercondensateur (98%)
+
+# Puissance nominale des éoliennes (3 MW = 3000 kW)
+puissance_nominale_eolienne_kw = 3000.0
+
+# Consommation des panneaux solaires (si applicable)
+consommation_panneau_solaire_kwh_par_jour = 1.3 # Consommation quotidienne par panneau solaire (kWh)
+
+# Crée un profil horaire simple (kWh par foyer) sur `duree_heures` heures:
+def generer_profil_consommation(duree_heures, season, nombre_foyers):
+    profil = []
+
+    # Adjust base consumption based on season
+    season_factor_consumption = 1.0
+    if season == "hiver":
+        season_factor_consumption = 1.2 # Higher consumption in winter
+    elif season == "été":
+        season_factor_consumption = 0.8 # Lower consumption in summer
+    # "printemps" and "automne" remain 1.0 (base consumption)
+
+    # --- Generate daily EV charging demands per household ---
+    num_full_days = duree_heures // 24
+    # We need demands for num_full_days + 1 to handle the wrap-around for the last day's charging
+    num_days_for_ev_demand = num_full_days + (1 if duree_heures % 24 > 0 else 0)
+
+    daily_ev_demands_per_household = np.zeros(num_days_for_ev_demand)
+
+    # Calculate the total duration of the EV charging window
+    # e.g., from 20h to 5h -> 20, 21, 22, 23, 0, 1, 2, 3, 4 (9 hours)
+    if heure_debut_recharge_ev <= heure_fin_recharge_ev:
+        charging_window_length = heure_fin_recharge_ev - heure_debut_recharge_ev
+    else: # Wraps around midnight
+        charging_window_length = (24 - heure_debut_recharge_ev) + heure_fin_recharge_ev
+
+    if charging_window_length <= 0:
+        # If the window is 0 or negative (e.g., start=5, end=5), assume no charging possible
+        charging_window_length = 0
+
+    for day_idx in range(num_days_for_ev_demand):
+        # For each household, determine if it has an EV and its daily energy need
+        # Using binomial to decide if a household has an EV for simplicity (0 or 1 EV per household)
+        if np.random.rand() < moyenne_voitures_par_foyer: # Simulating probability of having an EV
+            daily_ev_kwh_for_household = np.random.uniform(energie_quotidienne_min_recharge_ev_kwh, energie_quotidienne_max_recharge_ev_kwh)
+        else:
+            daily_ev_kwh_for_household = 0.0
+        daily_ev_demands_per_household[day_idx] = daily_ev_kwh_for_household
+
+    # --- Build the hourly consumption profile ---
+    for heure in range(duree_heures):
+        current_hour_of_day = heure % 24
+        current_day_index = heure // 24
+
+        base_consumption = 0.0
+        if current_hour_of_day < 6:  # Entre minuit et 6h du matin faible consommation
+            base_consumption = 0.2
+        elif current_hour_of_day < 9:  # Entre 6h et 9h du matin pic de consommation
+            base_consumption = 0.8
+        elif current_hour_of_day < 17:  # Entre 9h et 17h consommation moyenne
+            base_consumption = 0.5
+        else:  # Entre 17h et minuit pic de consommation
+            base_consumption = 0.9
+
+        # Introduce randomness
+        random_factor = np.random.uniform(0.8, 1.2)
+        randomized_consumption = base_consumption * random_factor * season_factor_consumption # Apply season_factor_consumption
+
+        # --- Add EV charging load for this hour (per household) ---
+        ev_charging_this_hour_per_household = 0.0
+        demand_day_index_for_ev = -1 # Index in daily_ev_demands_per_household array
+
+        if charging_window_length > 0: # Only if there's a valid charging window duration
+            if heure_debut_recharge_ev <= heure_fin_recharge_ev: # Charging does not wrap midnight
+                if heure_debut_recharge_ev <= current_hour_of_day < heure_fin_recharge_ev:
+                    demand_day_index_for_ev = current_day_index
+            else: # Charging wraps midnight (e.g., 20h-5h)
+                if current_hour_of_day >= heure_debut_recharge_ev: # Hours from start to midnight (e.g., 20, 21, 22, 23)
+                    demand_day_index_for_ev = current_day_index
+                elif current_hour_of_day < heure_fin_recharge_ev: # Hours from midnight to end (e.g., 0, 1, 2, 3, 4)
+                    demand_day_index_for_ev = current_day_index - 1 # This belongs to previous day's charging cycle
+
+        # Apply EV charging if the current hour is within a charging window and a valid demand index exists
+        if demand_day_index_for_ev >= 0 and demand_day_index_for_ev < len(daily_ev_demands_per_household):
+            daily_demand = daily_ev_demands_per_household[demand_day_index_for_ev]
+            if daily_demand > 0: # Only add if there's actual demand for this household on this day
+                ev_charging_this_hour_per_household = daily_demand / charging_window_length
+
+        randomized_consumption += ev_charging_this_hour_per_household
+
+        # Ensure consumption does not fall below a small positive value
+        if randomized_consumption < 0.05:
+            randomized_consumption = 0.05
+
+        profil.append(randomized_consumption)
+    return np.array(profil)
+
+
+# Crée un profil solaire par panneau (kWh par panneau et par heure)
+def generer_profil_solaire(duree_heures, season):
+    profil = []
+    daily_solar_factor = 1.0 # Initialize daily solar factor
+
+    # Adjust base solar production based on season
+    season_factor = 1.0
+    if season == "hiver":
+        season_factor = 0.6 # Lower production in winter
+    elif season == "printemps":
+        season_factor = 1.0 # Moderate production in spring (as per new instructions)
+    elif season == "été":
+        season_factor = 1.2 # Higher production in summer (as per new instructions)
+    elif season == "automne":
+        season_factor = 1.0 # Moderate production in autumn (as per new instructions)
+
+    for heure in range(duree_heures):
+        if heure % 24 == 0: # New day, generate a new random factor
+            daily_solar_factor = np.random.uniform(0.8, 1.2) # Daily solar variability
+
+        base_solar_production = 0.0
+        if heure % 24 < 6 or heure % 24 >= 18:  # Nuit (avant 6h ou après 18h) pas de production solaire
+            base_solar_production = 0.0
+        elif heure % 24 < 12:  # montée linéaire le matin (6h→12h)
+            base_solar_production = (heure % 24 - 6) / 6.0
+        elif heure % 24 < 14:  # Midi (entre midi et 14h) production maximale
+            base_solar_production = 1.0
+        else:  # descente linéaire le soir (14h→18h)!
+            base_solar_production = 1.0 - (heure % 24 - 14) / 4.0
+
+        # Introduce hourly randomness
+        hourly_solar_factor = np.random.uniform(0.9, 1.1) # Hourly solar variability
+        randomized_hourly_production = base_solar_production * daily_solar_factor * hourly_solar_factor * season_factor
+
+        # Ensure production is not negative
+        profil.append(max(0.0, randomized_hourly_production))
+
+    # Apply solar panel efficiency
+    hourly_production_before_consumption = np.array(profil) * rendement_panneaux_solaires
+
+    # Calculate hourly consumption per panel
+    hourly_panel_consumption = consommation_panneau_solaire_kwh_par_jour / 24.0
+
+    # Subtract consumption, ensuring net production is not negative
+    net_hourly_production = hourly_production_before_consumption - hourly_panel_consumption
+    net_hourly_production[net_hourly_production < 0] = 0
+
+    return net_hourly_production
+
+
+# Crée un profil éolien par éolienne (kWh par éolienne et par heure)
+def generer_profil_vent(duree_heures, season):
+    profil = []
+
+    # Adjust base wind production based on season
+    season_factor = 1.0
+    if season == "hiver":
+        season_factor = 1.2 # Higher wind in winter
+    elif season == "printemps":
+        season_factor = 1.1 # Slightly higher wind in spring
+    elif season == "été":
+        season_factor = 0.8 # Lower wind in summer
+    # "automne" (autumn) remains 1.0 (base production)
+
+    # Theoretical maximum relative output for scaling
+    max_valeur_jour = 1.4
+    max_hourly_wind_factor = 1.2
+    max_season_factor_for_scaling = 1.2 # Max season_factor is 1.2 (winter)
+    # The theoretical max 'randomized_hourly_production' before efficiency and final scaling
+    theoretical_max_relative_output = max_valeur_jour * max_hourly_wind_factor * max_season_factor_for_scaling
+
+    for heure in range(duree_heures):
+        if heure % 24 == 0:
+            valeur_jour = np.random.uniform(0.8, 1.4)  # Daily wind variability
+
+        # Introduce hourly randomness around the daily factor
+        hourly_wind_factor = np.random.uniform(0.8, 1.2) # Hourly wind variability
+        randomized_hourly_production = valeur_jour * hourly_wind_factor * season_factor
+
+        # Ensure production is not negative
+        profil.append(max(0.0, randomized_hourly_production))
+
+    # Current max effective output per turbine (after rendement_eolien, before final scaling)
+    # is theoretical_max_relative_output * rendement_eolien.
+    # We want this peak to be puissance_nominale_eolienne_kw.
+    # So, we scale the entire array by (puissance_nominale_eolienne_kw / (theoretical_max_relative_output * rendement_eolien))
+
+    # Avoid division by zero if rendement_eolien is 0 (though it's 0.5 here)
+    scaling_factor = puissance_nominale_eolienne_kw / (theoretical_max_relative_output * rendement_eolien) if (theoretical_max_relative_output * rendement_eolien) > 0 else 0
+
+    return np.array(profil) * rendement_eolien * scaling_factor
+
+
+# Simule la consommation et la production d'énergie avec une batterie
+# - Calcule l'énergie consommée, produite, prélevée sur le réseau, et injectée dans le réseau
+# - Suit l'état de charge de la batterie à chaque heure
+def simuler(
+    duree_heures,
+    nombre_foyers,
+    consommation,
+    solaire,
+    nombre_panneaux_solaires,
+    vent,
+    nombre_eoliennes,
+    etat_initial_batt1, # Existing battery
+    etat_initial_sc, # Supercapacitor
+):
+
+    consommation_totale = consommation * nombre_foyers  # Consommation totale de tous les foyers
+
+    # Production totale (solaire + éolien) - ajusté pour les unités de production
+    production_totale = (solaire * nombre_panneaux_solaires) + (vent * nombre_eoliennes)
+
+    # Initialize states of charge for all storage units (in kWh)
+    etat_batterie1_kwh = capacite_batterie_kwh * etat_initial_batt1 / 100.0
+    etat_supercondensateur_kwh = capacite_supercondensateur_kwh * etat_initial_sc / 100.0
+
+    energie_prelevee = []  # Énergie prélevée sur le réseau
+    energie_injectee = []  # Énergie injectée dans le réseau
+
+    # Tracking lists for all storage units' state of charge
+    etat_batterie1_pourcentage = []
+    etat_supercondensateur_pourcentage = []
+
+    joule_losses_total = 0.0 # Initialize total Joule losses
+
+    for heure in range(duree_heures):
+        # 1) Production meets consumption
+        energy_balance = production_totale[heure] - consommation_totale[heure]
+
+        # Handle Surplus energy (charging)
+        if energy_balance > 0:
+            # 2) Surplus energy charges the supercapacitor (to 100%)
+            max_charge_sc = capacite_supercondensateur_kwh * etat_charge_max_sc / 100.0 - etat_supercondensateur_kwh
+            charge_sc_attempt = energy_balance # Energy available to attempt charge
+            actual_charge_sc = min(charge_sc_attempt * rendement_supercondensateur, max_charge_sc)
+            etat_supercondensateur_kwh += actual_charge_sc
+            joule_losses_total += charge_sc_attempt - (actual_charge_sc / rendement_supercondensateur if rendement_supercondensateur > 0 else 0) # Track loss for supercapacitor
+            energy_balance -= (actual_charge_sc / rendement_supercondensateur if rendement_supercondensateur > 0 else 0) # Deduct actual energy used from balance, considering efficiency
+
+            # 3a) Remaining surplus charges Battery 1 (existing battery)
+            max_charge_batt1 = capacite_batterie_kwh * etat_charge_max / 100.0 - etat_batterie1_kwh
+            charge_batt1_attempt = energy_balance
+            actual_charge_batt1 = min(charge_batt1_attempt * rendement_batterie, max_charge_batt1)
+            etat_batterie1_kwh += actual_charge_batt1
+            joule_losses_total += charge_batt1_attempt - (actual_charge_batt1 / rendement_batterie if rendement_batterie > 0 else 0) # Track loss for battery 1
+            energy_balance -= (actual_charge_batt1 / rendement_batterie if rendement_batterie > 0 else 0)
+
+            # 4) Any further surplus is injected into the grid
+            energie_injectee.append(energy_balance)
+            energie_prelevee.append(0.0)
+
+        # Handle Deficit energy (discharging)
+        elif energy_balance < 0:
+            deficit = abs(energy_balance)
+
+            # 5) Draw from the supercapacitor first
+            max_discharge_sc = etat_supercondensateur_kwh - capacite_supercondensateur_kwh * etat_charge_min_sc / 100.0
+            discharge_sc_attempt = deficit / rendement_supercondensateur if rendement_supercondensateur > 0 else deficit # Energy to attempt draw, considering efficiency
+            actual_discharge_sc = min(discharge_sc_attempt, max_discharge_sc)
+            etat_supercondensateur_kwh -= actual_discharge_sc
+            joule_losses_total += (actual_discharge_sc / rendement_supercondensateur if rendement_supercondensateur > 0 else 0) - actual_discharge_sc # Track loss for supercapacitor
+            deficit -= actual_discharge_sc * rendement_supercondensateur # Reduce deficit by actual energy provided, considering efficiency
+
+            # 6a) Then draw from Battery  (existing battery)
+            max_discharge_batt1_by_level = etat_batterie1_kwh - capacite_batterie_kwh * etat_charge_min / 100.0
+            max_discharge_batt1_by_rate = capacite_batterie_kwh * max_decharge_horaire_batt_pourcentage / 100.0 # Using global max_decharge_horaire_batt_pourcentage
+            actual_discharge_batt1 = min(deficit, max_discharge_batt1_by_level, max_discharge_batt1_by_rate)
+            etat_batterie1_kwh -= actual_discharge_batt1
+            joule_losses_total += (actual_discharge_batt1 / rendement_batterie if rendement_batterie > 0 else 0) - actual_discharge_batt1 # Track loss for battery 1
+            deficit -= actual_discharge_batt1 * rendement_batterie
+
+            # 7) Any remaining deficit is drawn from the grid
+            energie_prelevee.append(deficit)
+            energie_injectee.append(0.0)
+
+        else:  # Équilibre entre production et consommation
+            energie_prelevee.append(0.0)
+            energie_injectee.append(0.0)
+
+        # Update state of charge percentages for all storage units
+        etat_batterie1_pourcentage.append(100.0 * etat_batterie1_kwh / capacite_batterie_kwh)
+        etat_supercondensateur_pourcentage.append(100.0 * etat_supercondensateur_kwh / capacite_supercondensateur_kwh)
+
+    return {
+        "consommation_totale": consommation_totale,
+        "production_totale": production_totale,
+        "energie_prelevee": np.array(energie_prelevee),
+        "energie_injectee": np.array(energie_injectee),
+        "etat_batterie1_pourcentage": np.array(etat_batterie1_pourcentage),
+        "etat_supercondensateur_pourcentage": np.array(etat_supercondensateur_pourcentage),
+        "joule_losses_total": joule_losses_total, # Return total Joule losses
+    }
+
+
+# Affiche les résultats de la simulation sous forme de graphiques
+def plot_results(hours: int, results: dict, solaire_profile: np.ndarray, vent_profile: np.ndarray, num_solar_panels: int, num_wind_turbines: int) -> None:
+    x = np.arange(hours)  # Axe des heures
+    fig, axs = plt.subplots(4, 1, figsize=(10, 12), sharex=True)  # Créer une figure avec 4 sous-graphiques
+
+    # 1) Consommation totale et production totale
+    axs[0].plot(x, results["consommation_totale"], label="Consommation totale (kWh)", color="tab:red")
+    axs[0].plot(x, results["production_totale"], label="Production totale (kWh)", color="tab:green", alpha=0.6)
+    axs[0].set_ylabel("kWh")  # Étiquette de l'axe Y
+    axs[0].legend()  # Ajouter une légende
+    axs[0].grid(True)  # Ajouter une grille
+
+    # 2) Production solaire et éolienne
+    axs[1].plot(x, solaire_profile * num_solar_panels, label="Production solaire (kWh)", color="orange")
+    axs[1].plot(x, vent_profile * num_wind_turbines, label="Production éolienne (kWh)", color="blue")
+    axs[1].set_ylabel("kWh")  # Étiquette de l'axe Y
+    axs[1].legend()  # Ajouter une légende
+    axs[1].grid(True)  # Ajouter une grille
+
+    # 3) Énergie prélevée sur le réseau (positive) et injectée dans le réseau (négative)
+    axs[2].bar(x, results["energie_prelevee"], color="tab:blue", label="Énergie prélevée (kWh)")
+    axs[2].bar(x, -results["energie_injectee"], color="tab:red", label="Énergie injectée (kWh)") # Plot injected as negative
+    axs[2].set_ylabel("kWh")  # Étiquette de l'axe Y
+    axs[2].legend()  # Ajouter une légende
+    axs[2].grid(True)  # Ajouter une grille
+
+    # 4) État de charge des batteries et supercondensateur
+    axs[3].plot(x, results["etat_batterie1_pourcentage"], color="tab:purple", label="État de charge batterie 1 (%)")
+    axs[3].plot(x, results["etat_supercondensateur_pourcentage"], color="tab:cyan", label="État de charge supercondensateur (%)")
+    axs[3].set_ylabel("État de charge (%)")  # Étiquette de l'axe Y
+    axs[3].set_xlabel("Heure")  # Étiquette de l'axe X
+    axs[3].legend()  # Ajouter une légende
+    axs[3].grid(True)  # Ajouter une grille
+
+    plt.tight_layout()  # Ajuster les marges pour éviter les chevauchements
+    plt.show()  # Afficher les graphiques
+
+
+# -------------------- Code principal --------------------
+
+
+# Étape 1 : Demander la durée de la simulation (en jours)
+try:
+    raw_days = input("Durée de la simulation en jours (entier > 0) — ex: 3: ").strip()
+    duree_jours = int(raw_days)  # Convertir l'entrée utilisateur en entier
+    if duree_jours <= 0:
+        raise ValueError  # Lever une erreur si l'entrée est invalide
+    duree_heures = duree_jours * 24 # Convertir la durée en heures
+except Exception:
+    print("Entrée invalide — relancez et saisissez un entier > 0 pour la durée de la simulation en jours.")
+    sys.exit(1)  # Quitter le programme en cas d'erreur
+
+# Étape 2 : Demander le nombre de foyers
+try:
+    nombre_foyers = int(input("Nombre de foyers (ex: 10): ").strip())
+    if nombre_foyers <= 0:
+        raise ValueError  # Lever une erreur si l'entrée est invalide
+except Exception:
+    print("Entrée invalide — veuillez relancer et saisir un entier > 0 pour le nombre de foyers.")
+    sys.exit(1)  # Quitter le programme en cas d'erreur
+
+# Étape 3: Demander le nombre de panneaux solaires
+try:
+    nombre_panneaux_solaires = int(input("Nombre de panneaux solaires (ex: 10): ").strip())
+    if nombre_panneaux_solaires < 0:
+        raise ValueError
+except Exception:
+    print("Entrée invalide — veuillez relancer et saisir un entier >= 0 pour le nombre de panneaux solaires.")
+    sys.exit(1)
+
+# Étape 4: Demander le nombre d'éoliennes
+try:
+    nombre_eoliennes = int(input("Nombre d'éoliennes (ex: 5): ").strip())
+    if nombre_eoliennes < 0:
+        raise ValueError
+except Exception:
+    print("Entrée invalide — veuillez relancer et saisir un entier >= 0 pour le nombre d'éoliennes.")
+    sys.exit(1)
+
+# Étape 5: Demander la saison de la simulation
+try:
+    season = input("Saison de la simulation (hiver, printemps, été, automne) — ex: été: ").strip().lower()
+    if season not in ["hiver", "printemps", "été", "automne"]:
+        raise ValueError
+except Exception:
+    print("Entrée invalide — veuillez relancer et saisir l'une des saisons suivantes: hiver, printemps, été, automne.")
+    sys.exit(1)
+
+
+
+# Initialize variables to store results of the *last* simulation for plotting
+last_results = None
+last_solaire_profile = None
+last_vent_profile = None
+last_num_solar_panels = 0
+last_num_wind_turbines = 0
+
+# Initialize a list to store summary data for all simulations
+all_simulation_results = []
+
+# Wrap the simulation logic in a loop
+for i in range(1):
+
+
+    # Générer les profils de consommation, solaire et éolien (these will be different for each simulation due to randomness)
+    consommation_current_sim = generer_profil_consommation(duree_heures, season, nombre_foyers)
+    solaire_current_sim = generer_profil_solaire(duree_heures, season)
+    vent_current_sim = generer_profil_vent(duree_heures, season)
+
+    # Définir les états initiaux des batteries et supercondensateur (hardcodé à 50% pour chaque sim)
+    etat_initial_batt1 = 50.0
+    etat_initial_sc = 50.0
+
+    # Simuler la consommation et la production d'énergie
+    current_results = simuler(
+        duree_heures=duree_heures,
+        nombre_foyers=nombre_foyers,
+        consommation=consommation_current_sim,
+        solaire=solaire_current_sim,
+        nombre_panneaux_solaires=nombre_panneaux_solaires,
+        vent=vent_current_sim,
+        nombre_eoliennes=nombre_eoliennes,
+        etat_initial_batt1=etat_initial_batt1,
+        etat_initial_sc=etat_initial_sc,
+    )
+
+    # Calculate totals for summary
+    total_consumption_current_sim = current_results["consommation_totale"].sum()
+    total_import_current_sim = current_results["energie_prelevee"].sum()
+    total_export_current_sim = current_results["energie_injectee"].sum()
+    total_joule_losses_current_sim = current_results["joule_losses_total"]
+
+    # Store summary data for the current simulation
+    all_simulation_results.append({
+        "Simulation_Num": i + 1,
+        "Total_Consumption_kWh": total_consumption_current_sim,
+        "Total_Import_kWh": total_import_current_sim,
+        "Total_Export_kWh": total_export_current_sim,
+        "Total_Joule_Losses_kWh": total_joule_losses_current_sim,
+    })
+
+    # Keep track of the last simulation's full results for plotting
+    last_results = current_results
+    last_solaire_profile = solaire_current_sim
+    last_vent_profile = vent_current_sim
+    last_num_solar_panels = nombre_panneaux_solaires
+    last_num_wind_turbines = nombre_eoliennes
+
+
+
+# Display summary of the last simulation
+if last_results:
+    print("\n--- Résumé de la DERNIÈRE simulation ---")
+    print(f"Consommation totale simulée: {last_results['consommation_totale'].sum():.2f} kWh")
+    print(f"Quantité piochée dans le réseau: {last_results['energie_prelevee'].sum():.2f} kWh")
+    print(f"Quantité injectée dans le réseau: {last_results['energie_injectee'].sum():.2f} kWh")
+    print(f"Énergie perdue par effet Joule dans les systèmes de stockage: {last_results['joule_losses_total']:.2f} kWh")
+
+    # Display graphs of the last simulation
+    print("\n--- Graphiques de la DERNIÈRE simulation ---")
+    plot_results(duree_heures, last_results, last_solaire_profile, last_vent_profile, last_num_solar_panels, last_num_wind_turbines)
